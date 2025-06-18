@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: api-horarios-especificos
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    envVars:
+      - key: FLASK_ENV
+        value: production
+3
