@@ -5,6 +5,7 @@ from flask_cors import CORS
 from librouteros import connect
 import datetime
 import logging
+import os
 
 # Configurar logging para depuración
 logging.basicConfig(level=logging.DEBUG)
@@ -114,6 +115,6 @@ def programar_acceso():
         logger.error(f"Error al programar regla: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
