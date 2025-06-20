@@ -22,12 +22,13 @@ def get_api():
             username=USERNAME,
             password=PASSWORD,
             host=MIKROTIK_API_HOST,
-            port=API_PORT
+            port=API_PORT,
+            timeout=10
         )
-        logger.debug("Conexión establecida con RouterOS")
+        logger.debug("✅ Conexión establecida con RouterOS")
         return connection
     except Exception as e:
-        logger.error(f"Error al conectar con RouterOS: {str(e)}")
+        logger.exception("❌ Error al conectar con RouterOS")
         raise
 
 @app.route('/programar', methods=['POST'])
