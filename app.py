@@ -1,36 +1,41 @@
 from flask import Flask, jsonify, request
+import os
+import requests
+from requests.auth import HTTPBasicAuth
 from flask_cors import CORS
-from librouteros import connect
 import datetime
 import logging
-import os
+import urllib3
 
-# Configuración de logging
+# Configuración y logging
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# Configuración del MikroTik
-MIKROTIK_API_HOST = os.environ.get('MIKROTIK_API_HOST', 'tcp://8.tcp.us-cal-1.ngrok.io:18948')
+# Configuración MikroTik desde env
+MIKROTIK_HOST = os.environ.get('MIKROTIK_HOST', 'https://tu-ngrok-or-host')
 USERNAME = os.environ.get('MIKROTIK_USER', 'admin')
 PASSWORD = os.environ.get('MIKROTIK_PASSWORD', '1234567890')
-API_PORT = int(os.environ.get('MIKROTIK_API_PORT', 8728))
+REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', 10))
 
-def get_api():
+def verify_mikrotik_connection():
+    test_url = f"{MIKROTIK_HOST}/rest/system/resource"
     try:
-        connection = connect(
-            username=USERNAME,
-            password=PASSWORD,
-            host=MIKROTIK_API_HOST,
-            port=API_PORT
+        logger.info(f"Verificando conexión con MikroTik en: {MIKROTIK_HOST}")
+        resp = requests.get(
+            test_url,
+            auth=HTTPBasicAuth(USERNAME, PASSWORD),
+            timeout=REQUEST_TIMEOUT,
+            verify=False
         )
-        logger.debug(f"Conexión establecida con RouterOS {MIKROTIK_API_HOST}")
-        return connection
-    except Exception as e:
-        logger.error(f"Error al conectar con RouterOS: {str(e)}")
-        raise
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Error al conectar con MikroTik: {e}")
+        return False
 
 @app.route('/programar', methods=['POST'])
 def programar_acceso():
@@ -45,68 +50,75 @@ def programar_acceso():
 
     comment_base = f"Programado-{ip}"
     fecha_hoy = datetime.datetime.now().strftime('%b/%d/%Y')
+    auth = HTTPBasicAuth(USERNAME, PASSWORD)
+
+    if not verify_mikrotik_connection():
+        return jsonify({'error': 'No hay conexión con MikroTik'}), 500
+
+    firewall_url = f"{MIKROTIK_HOST}/rest/ip/firewall/filter"
+    scheduler_url = f"{MIKROTIK_HOST}/rest/system/scheduler"
 
     try:
-        api = get_api()
+        # 1. Regla drop
+        payload_block = {
+            "chain": "forward",
+            "src-address": ip,
+            "action": "drop",
+            "comment": f"{comment_base}-bloqueo",
+            "disabled": "no"
+        }
+        resp_block = requests.post(firewall_url, json=payload_block, auth=auth, verify=False)
+        logger.debug(f"Firewall drop: {resp_block.status_code} {resp_block.text}")
 
-        # Regla de bloqueo
-        firewall = api.path('ip', 'firewall', 'filter')
-        firewall.add(
-            chain='forward',
-            src_address=ip,
-            action='drop',
-            comment=f"{comment_base}-bloqueo",
-            disabled='no'
-        )
+        # 2. Regla accept (deshabilitada)
+        payload_accept = {
+            "chain": "forward",
+            "src-address": ip,
+            "action": "accept",
+            "comment": f"{comment_base}-acceso",
+            "disabled": "yes"
+        }
+        resp_accept = requests.post(firewall_url, json=payload_accept, auth=auth, verify=False)
+        logger.debug(f"Firewall accept: {resp_accept.status_code} {resp_accept.text}")
 
-        # Regla de aceptación (deshabilitada)
-        firewall.add(
-            chain='forward',
-            src_address=ip,
-            action='accept',
-            comment=f"{comment_base}-acceso",
-            disabled='yes'
-        )
+        # 3. Scheduler activar
+        payload_sched_start = {
+            "name": f"activar-{ip}",
+            "start-time": hora_inicio,
+            "start-date": fecha_hoy,
+            "interval": "1d",
+            "on-event": f'/ip firewall filter enable [find comment="{comment_base}-acceso"];\n/ip firewall filter disable [find comment="{comment_base}-bloqueo"];',
+            "comment": f"Activar acceso {ip}",
+            "policy": "read,write,policy,test",
+            "disabled": "no"
+        }
+        resp_sched_start = requests.post(scheduler_url, json=payload_sched_start, auth=auth, verify=False)
+        logger.debug(f"Scheduler activar: {resp_sched_start.status_code} {resp_sched_start.text}")
 
-        scheduler = api.path('system', 'scheduler')
+        # 4. Scheduler desactivar
+        payload_sched_stop = {
+            "name": f"desactivar-{ip}",
+            "start-time": hora_fin,
+            "start-date": fecha_hoy,
+            "interval": "1d",
+            "on-event": f'/ip firewall filter disable [find comment="{comment_base}-acceso"];\n/ip firewall filter enable [find comment="{comment_base}-bloqueo"];',
+            "comment": f"Desactivar acceso {ip}",
+            "policy": "read,write,policy,test",
+            "disabled": "no"
+        }
+        resp_sched_stop = requests.post(scheduler_url, json=payload_sched_stop, auth=auth, verify=False)
+        logger.debug(f"Scheduler desactivar: {resp_sched_stop.status_code} {resp_sched_stop.text}")
 
-        # Scheduler activar
-        scheduler.add(
-            name=f"activar-{ip}",
-            start_time=hora_inicio,
-            start_date=fecha_hoy,
-            interval='1d',
-            on_event=(
-                f'/ip firewall filter enable [find comment="{comment_base}-acceso"];\n'
-                f'/ip firewall filter disable [find comment="{comment_base}-bloqueo"];'
-            ),
-            comment=f"Activar acceso {ip}",
-            policy='read,write,policy,test',
-            disabled='no'
-        )
+        # Verifica que todas sean OK
+        for resp in [resp_block, resp_accept, resp_sched_start, resp_sched_stop]:
+            if resp.status_code >= 400:
+                return jsonify({"error": f"{resp.status_code}", "detalle": resp.text}), 500
 
-        # Scheduler desactivar
-        scheduler.add(
-            name=f"desactivar-{ip}",
-            start_time=hora_fin,
-            start_date=fecha_hoy,
-            interval='1d',
-            on_event=(
-                f'/ip firewall filter disable [find comment="{comment_base}-acceso"];\n'
-                f'/ip firewall filter enable [find comment="{comment_base}-bloqueo"];'
-            ),
-            comment=f"Desactivar acceso {ip}",
-            policy='read,write,policy,test',
-            disabled='no'
-        )
-
-        logger.info(f"Se han programado las reglas para {ip}")
-        return jsonify({'message': f'Reglas programadas exitosamente para {ip}'}), 200
+        return jsonify({"message": f"Reglas programadas exitosamente para {ip}"}), 200
 
     except Exception as e:
-        logger.error(f"Error al programar regla: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
+        logger.error(f"Error programando acceso: {e}")
+        return jsonify({"error": str(e)}), 500
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Iniciando servidor en puerto {port}")
