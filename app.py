@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-MIKROTIK_API_HOST = os.environ.get('MIKROTIK_API_HOST', 'tcp://8.tcp.us-cal-1.ngrok.io:18948')
+MIKROTIK_API_HOST = os.environ.get('MIKROTIK_API_HOST', '8.tcp.us-cal-1.ngrok.io:18948')
 USERNAME = os.environ.get('MIKROTIK_USERNAME', 'admin')
 PASSWORD = os.environ.get('MIKROTIK_PASSWORD', '1234567890')
 API_PORT = int(os.environ.get('MIKROTIK_API_PORT', 8728))
