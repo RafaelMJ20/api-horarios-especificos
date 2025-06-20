@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from librouteros import connect
+import requests
+from requests.auth import HTTPBasicAuth
 import datetime
 import logging
 import os
@@ -28,32 +30,58 @@ logger = logging.getLogger(__name__)
 # =======================
 # Configuración MikroTik (usar variables de entorno en producción)
 # =======================
-MIKROTIK_HOST = os.getenv('MIKROTIK_HOST', '192.168.88.1')
+MIKROTIK_HOST = os.getenv('MIKROTIK_HOST', 'https://f12c-2605-59c8-74d2-e610-00-c8b.ngrok-free.app')
 USERNAME = os.getenv('MIKROTIK_USER', 'admin')
 PASSWORD = os.getenv('MIKROTIK_PASSWORD', '1234567890')
-API_PORT = int(os.getenv('MIKROTIK_PORT', '8728'))
+API_PORT = 8728
 REQUEST_TIMEOUT = 10
+
+# =======================
+# Funciones de conexión mejoradas (REST + librouteros)
+# =======================
+def verify_mikrotik_connection() -> bool:
+    """Verifica conexión usando REST API (para comprobación rápida)"""
+    test_url = f"{MIKROTIK_HOST}/rest/system/resource"
+    try:
+        logger.info(f"Verificando conexión REST con MikroTik en: {MIKROTIK_HOST}")
+        response = requests.get(
+            test_url,
+            auth=HTTPBasicAuth(USERNAME, PASSWORD),
+            timeout=REQUEST_TIMEOUT,
+            verify=False  # Solo para desarrollo con Ngrok sin certificado válido
+        )
+        response.raise_for_status()
+        logger.info("Conexión REST exitosa con MikroTik")
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error en conexión REST: {str(e)}")
+        return False
+
+def get_api_connection() -> 'Api':
+    """Establece conexión usando librouteros (para operaciones reales)"""
+    try:
+        # Extraer hostname sin protocolo para librouteros
+        hostname = MIKROTIK_HOST.replace('https://', '').replace('http://', '')
+        
+        logger.info(f"Conectando a MikroTik via librouteros en: {hostname}:{API_PORT}")
+        
+        connection = connect(
+            username=USERNAME,
+            password=PASSWORD,
+            host=hostname,
+            port=API_PORT,
+            timeout=REQUEST_TIMEOUT,
+            ssl=False  # Ngrok ya maneja SSL
+        )
+        logger.info("Conexión librouteros exitosa")
+        return connection
+    except Exception as e:
+        logger.error(f"Error en conexión librouteros: {str(e)}", exc_info=True)
+        raise
 
 # =======================
 # Funciones auxiliares mejoradas
 # =======================
-def get_api_connection() -> 'Api':
-    """Establece conexión segura con MikroTik"""
-    try:
-        logger.info(f"Conectando a {MIKROTIK_HOST}:{API_PORT}")
-        connection = connect(
-            username=USERNAME,
-            password=PASSWORD,
-            host=MIKROTIK_HOST,
-            port=API_PORT,
-            timeout=REQUEST_TIMEOUT
-        )
-        logger.info("Conexión exitosa con MikroTik")
-        return connection
-    except Exception as e:
-        logger.error(f"Error de conexión: {str(e)}", exc_info=True)
-        raise
-
 def validate_time_format(time_str: str) -> bool:
     """Valida formato HH:MM:SS"""
     return bool(re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$', time_str))
@@ -123,6 +151,10 @@ def schedule_access():
         return jsonify({'error': 'Formato de hora fin inválido (HH:MM:SS)'}), 400
     if not validate_days(days):
         return jsonify({'error': 'Días inválidos (usar: mon,tue,wed,etc.)'}), 400
+
+    # Verificar conexión primero con REST
+    if not verify_mikrotik_connection():
+        return jsonify({'error': 'No se pudo verificar la conexión con MikroTik'}), 502
 
     try:
         api = get_api_connection()
@@ -199,7 +231,8 @@ def schedule_access():
                 'enable': f"enable-{ip}-{timestamp}",
                 'disable': f"disable-{ip}-{timestamp}"
             },
-            'cleanup_counts': cleanup_counts
+            'cleanup_counts': cleanup_counts,
+            'connection_method': 'REST + librouteros via Ngrok'
         }), 200
 
     except Exception as e:
@@ -214,26 +247,18 @@ def schedule_access():
 # =======================
 @app.route('/status', methods=['GET'])
 def service_status():
-    """Verifica estado del servicio"""
-    try:
-        api = get_api_connection()
-        api.close()
-        return jsonify({
-            'status': 'active',
-            'mikrotik_connection': True,
-            'timestamp': datetime.datetime.now().isoformat()
-        }), 200
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'mikrotik_connection': False,
-            'error': str(e),
-            'timestamp': datetime.datetime.now().isoformat()
-        }), 503
+    """Verifica estado del servicio usando REST"""
+    connection_status = verify_mikrotik_connection()
+    return jsonify({
+        'status': 'active',
+        'mikrotik_connection': connection_status,
+        'timestamp': datetime.datetime.now().isoformat(),
+        'connection_method': 'REST API'
+    }), 200 if connection_status else 503
 
 @app.route('/list-schedules', methods=['GET'])
 def list_schedules():
-    """Lista todas las programaciones activas"""
+    """Lista todas las programaciones activas usando librouteros"""
     try:
         api = get_api_connection()
         scheduler = api.path('system', 'scheduler')
@@ -250,7 +275,10 @@ def list_schedules():
                     'disabled': task.get('disabled') == 'true'
                 })
         
-        return jsonify({'schedules': schedules}), 200
+        return jsonify({
+            'schedules': schedules,
+            'connection_method': 'librouteros'
+        }), 200
     except Exception as e:
         logger.error(f"Error al listar programaciones: {str(e)}")
         return jsonify({'error': str(e)}), 500
