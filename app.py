@@ -13,7 +13,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuración del MikroTik
-MIKROTIK_API_HOST = os.environ.get('MIKROTIK_API_HOST', 'https://f12c-2605-59c8-74d2-e610-00-c8b.ngrok-free.app')
+MIKROTIK_API_HOST = os.environ.get('MIKROTIK_API_HOST', 'f12c-2605-59c8-74d2-e610-00-c8b.ngrok-free.app')
 USERNAME = os.environ.get('MIKROTIK_USER', 'admin')
 PASSWORD = os.environ.get('MIKROTIK_PASSWORD', '1234567890')
 API_PORT = int(os.environ.get('MIKROTIK_API_PORT', 8728))
