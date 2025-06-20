@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # =======================
 # Configuración MikroTik (usar variables de entorno en producción)
 # =======================
-MIKROTIK_API_HOST = os.getenv('MIKROTIK_HOST', '192.168.88.1')
+MIKROTIK_API_HOST = os.getenv('MIKROTIK_HOST', 'https://f12c-2605-59c8-74d2-e610-00-c8b.ngrok-free.app')
 USERNAME = os.getenv('MIKROTIK_USER', 'admin')
 PASSWORD = os.getenv('MIKROTIK_PASSWORD', '1234567890')
 API_PORT = int(os.getenv('MIKROTIK_PORT', '8728'))
