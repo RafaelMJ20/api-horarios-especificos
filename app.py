@@ -5,13 +5,6 @@ import datetime
 import logging
 import os
 
-logging.basicConfig(level=logging.DEBUG)from flask import Flask, jsonify, request
-from flask_cors import CORS
-from librouteros import connect
-import datetime
-import logging
-import os
-
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
