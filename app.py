@@ -1,13 +1,12 @@
 from flask import Flask, jsonify, request
-import requests
-from requests.auth import HTTPBasicAuth
 from flask_cors import CORS
 from librouteros import connect
 import datetime
 import logging
 import os
 import sys
-from functools import wraps
+import re
+from typing import Dict, List, Optional
 
 # =======================
 # Configuración inicial
@@ -21,7 +20,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('api_mikrotik.log')
+        logging.FileHandler('mikrotik_scheduler.log')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -29,24 +28,25 @@ logger = logging.getLogger(__name__)
 # =======================
 # Configuración MikroTik (usar variables de entorno en producción)
 # =======================
-MIKROTIK_API_HOST = os.getenv('MIKROTIK_HOST', 'https://f12c-2605-59c8-74d2-e610-00-c8b.ngrok-free.app')
+MIKROTIK_HOST = os.getenv('MIKROTIK_HOST', '192.168.88.1')
 USERNAME = os.getenv('MIKROTIK_USER', 'admin')
 PASSWORD = os.getenv('MIKROTIK_PASSWORD', '1234567890')
 API_PORT = int(os.getenv('MIKROTIK_PORT', '8728'))
+REQUEST_TIMEOUT = 10
 
 # =======================
-# Funciones auxiliares
+# Funciones auxiliares mejoradas
 # =======================
-def get_api_connection():
-    """Establece conexión con MikroTik con logging detallado"""
+def get_api_connection() -> 'Api':
+    """Establece conexión segura con MikroTik"""
     try:
-        logger.info(f"Intentando conexión a {MIKROTIK_API_HOST}:{API_PORT}")
+        logger.info(f"Conectando a {MIKROTIK_HOST}:{API_PORT}")
         connection = connect(
             username=USERNAME,
             password=PASSWORD,
-            host=MIKROTIK_API_HOST,
+            host=MIKROTIK_HOST,
             port=API_PORT,
-            timeout=10
+            timeout=REQUEST_TIMEOUT
         )
         logger.info("Conexión exitosa con MikroTik")
         return connection
@@ -54,137 +54,212 @@ def get_api_connection():
         logger.error(f"Error de conexión: {str(e)}", exc_info=True)
         raise
 
-def log_network_activity(ip, action):
-    """Registra actividad de red en un archivo separado"""
-    with open('network_activity.log', 'a') as f:
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        f.write(f"{timestamp} - IP: {ip} - Acción: {action}\n")
+def validate_time_format(time_str: str) -> bool:
+    """Valida formato HH:MM:SS"""
+    return bool(re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$', time_str))
+
+def validate_days(days_str: str) -> bool:
+    """Valida días de la semana (mon,tue,wed,...)"""
+    valid_days = {'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'}
+    days = days_str.split(',')
+    return all(day.strip() in valid_days for day in days)
+
+def cleanup_old_rules(api: 'Api', ip: str) -> Dict[str, int]:
+    """Elimina reglas y programaciones antiguas para la misma IP"""
+    counts = {'filter_rules': 0, 'scheduler_rules': 0}
+    
+    # Limpiar reglas de firewall antiguas
+    firewall = api.path('ip', 'firewall', 'filter')
+    for rule in firewall:
+        if rule.get('src-address') == ip and "Programado" in rule.get('comment', ''):
+            firewall.remove(id=rule['.id'])
+            counts['filter_rules'] += 1
+            logger.info(f"Eliminada regla firewall: {rule['.id']}")
+
+    # Limpiar programaciones antiguas
+    scheduler = api.path('system', 'scheduler')
+    for task in scheduler:
+        if f"Programado-{ip}" in task.get('name', ''):
+            scheduler.remove(id=task['.id'])
+            counts['scheduler_rules'] += 1
+            logger.info(f"Eliminada tarea programada: {task['.id']}")
+
+    return counts
 
 # =======================
-# Endpoints de la API
+# Endpoint principal para programación
 # =======================
-@app.route('/programar', methods=['POST'])
-def programar_acceso():
+@app.route('/schedule', methods=['POST'])
+def schedule_access():
     """
     Programa acceso por IP en horarios específicos
     Ejemplo de body JSON:
     {
         "ip_address": "192.168.88.100",
-        "hora_inicio": "08:00:00",
-        "hora_fin": "18:00:00",
-        "dias": "mon,tue,wed,thu,fri"
+        "start_time": "08:00:00",
+        "end_time": "17:00:00",
+        "days": "mon,tue,wed,thu,fri",
+        "timezone": "America/Lima"  # Opcional
     }
     """
     data = request.get_json()
     
-    # Validación de datos
-    required_fields = ['ip_address', 'hora_inicio', 'hora_fin', 'dias']
+    # Validación de entrada
+    required_fields = ['ip_address', 'start_time', 'end_time', 'days']
     if not all(field in data for field in required_fields):
         logger.warning("Solicitud incompleta recibida")
-        return jsonify({'error': 'Faltan campos requeridos'}), 400
-    
+        return jsonify({'error': 'Faltan campos requeridos', 'required': required_fields}), 400
+
     ip = data['ip_address']
-    hora_inicio = data['hora_inicio']
-    hora_fin = data['hora_fin']
-    dias = data['dias']
+    start_time = data['start_time']
+    end_time = data['end_time']
+    days = data['days']
+    timezone = data.get('timezone', 'UTC')
+
+    # Validación de formatos
+    if not validate_time_format(start_time):
+        return jsonify({'error': 'Formato de hora inicio inválido (HH:MM:SS)'}), 400
+    if not validate_time_format(end_time):
+        return jsonify({'error': 'Formato de hora fin inválido (HH:MM:SS)'}), 400
+    if not validate_days(days):
+        return jsonify({'error': 'Días inválidos (usar: mon,tue,wed,etc.)'}), 400
 
     try:
-        # Registrar intento de conexión
-        log_network_activity(ip, f"Programando acceso {hora_inicio}-{hora_fin} dias:{dias}")
-        
         api = get_api_connection()
-        comment_base = f"Programado-{ip}-{datetime.datetime.now().strftime('%Y%m%d')}"
+        timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        base_comment = f"Programado-{ip}-{timestamp}"
 
-        # Configurar reglas de firewall
+        # Limpiar reglas antiguas para esta IP
+        cleanup_counts = cleanup_old_rules(api, ip)
+        logger.info(f"Reglas limpiadas: {cleanup_counts}")
+
+        # Crear reglas de firewall
         firewall = api.path('ip', 'firewall', 'filter')
         
-        # 1. Regla de bloqueo
-        firewall.add(
+        # Regla de bloqueo (activa por defecto)
+        block_rule = firewall.add(
             chain='forward',
             src_address=ip,
             action='drop',
-            comment=f"{comment_base}-block",
+            comment=f"{base_comment}-block",
             disabled='no'
         )
-        logger.info(f"Regla de bloqueo creada para {ip}")
+        logger.info(f"Regla de bloqueo creada: {block_rule}")
 
-        # 2. Regla de permiso (inicialmente deshabilitada)
-        firewall.add(
+        # Regla de permiso (inactiva por defecto)
+        allow_rule = firewall.add(
             chain='forward',
             src_address=ip,
             action='accept',
-            comment=f"{comment_base}-allow",
+            comment=f"{base_comment}-allow",
             disabled='yes'
         )
-        logger.info(f"Regla de permiso creada para {ip}")
+        logger.info(f"Regla de permiso creada: {allow_rule}")
 
         # Configurar programador
         scheduler = api.path('system', 'scheduler')
 
         # Tarea para habilitar acceso
-        scheduler.add(
-            name=f"enable-{ip}",
-            start_time=hora_inicio,
-            start_date=datetime.datetime.now().strftime('%b/%d/%Y'),
-            interval='1d',
-            on_event=f"""/ip firewall filter enable [find comment="{comment_base}-allow"];
-                        /ip firewall filter disable [find comment="{comment_base}-block"];""",
-            comment=f"Enable access for {ip}",
+        enable_task = scheduler.add(
+            name=f"enable-{ip}-{timestamp}",
+            start_time=start_time,
+            start_date=datetime.datetime.now().strftime('%Y-%m-%d'),
+            interval=f"{days}",
+            on_event=f"""/ip firewall filter enable [find comment="{base_comment}-allow"];
+                        /ip firewall filter disable [find comment="{base_comment}-block"];""",
+            comment=f"Habilitar acceso {ip} {start_time} {days}",
             policy='read,write,test',
             disabled='no'
         )
-        logger.info(f"Tarea programada para habilitar acceso a {ip} a las {hora_inicio}")
+        logger.info(f"Tarea de habilitación creada: {enable_task}")
 
         # Tarea para deshabilitar acceso
-        scheduler.add(
-            name=f"disable-{ip}",
-            start_time=hora_fin,
-            start_date=datetime.datetime.now().strftime('%b/%d/%Y'),
-            interval='1d',
-            on_event=f"""/ip firewall filter disable [find comment="{comment_base}-allow"];
-                        /ip firewall filter enable [find comment="{comment_base}-block"];""",
-            comment=f"Disable access for {ip}",
+        disable_task = scheduler.add(
+            name=f"disable-{ip}-{timestamp}",
+            start_time=end_time,
+            start_date=datetime.datetime.now().strftime('%Y-%m-%d'),
+            interval=f"{days}",
+            on_event=f"""/ip firewall filter disable [find comment="{base_comment}-allow"];
+                        /ip firewall filter enable [find comment="{base_comment}-block"];""",
+            comment=f"Deshabilitar acceso {ip} {end_time} {days}",
             policy='read,write,test',
             disabled='no'
         )
-        logger.info(f"Tarea programada para deshabilitar acceso a {ip} a las {hora_fin}")
+        logger.info(f"Tarea de deshabilitación creada: {disable_task}")
 
         return jsonify({
             'status': 'success',
-            'message': f'Acceso programado para {ip} de {hora_inicio} a {hora_fin} días {dias}',
-            'rules_created': [
-                f"{comment_base}-block",
-                f"{comment_base}-allow"
-            ],
-            'scheduled_tasks': [
-                f"enable-{ip}",
-                f"disable-{ip}"
-            ]
+            'message': f'Acceso programado para {ip} de {start_time} a {end_time} días {days}',
+            'timezone': timezone,
+            'rules_created': {
+                'block': f"{base_comment}-block",
+                'allow': f"{base_comment}-allow"
+            },
+            'scheduled_tasks': {
+                'enable': f"enable-{ip}-{timestamp}",
+                'disable': f"disable-{ip}-{timestamp}"
+            },
+            'cleanup_counts': cleanup_counts
         }), 200
 
     except Exception as e:
         logger.error(f"Error al programar acceso: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+    finally:
+        if 'api' in locals():
+            api.close()
 
+# =======================
+# Endpoints adicionales
+# =======================
 @app.route('/status', methods=['GET'])
-def status_check():
-    """Endpoint para verificar estado del servicio"""
+def service_status():
+    """Verifica estado del servicio"""
     try:
         api = get_api_connection()
         api.close()
-        status = "connected"
+        return jsonify({
+            'status': 'active',
+            'mikrotik_connection': True,
+            'timestamp': datetime.datetime.now().isoformat()
+        }), 200
     except Exception as e:
-        status = f"disconnected: {str(e)}"
-    
-    return jsonify({
-        'service': 'mikrotik-access-scheduler',
-        'status': status,
-        'timestamp': datetime.datetime.now().isoformat(),
-        'mikrotik_host': MIKROTIK_API_HOST
-    })
+        return jsonify({
+            'status': 'error',
+            'mikrotik_connection': False,
+            'error': str(e),
+            'timestamp': datetime.datetime.now().isoformat()
+        }), 503
+
+@app.route('/list-schedules', methods=['GET'])
+def list_schedules():
+    """Lista todas las programaciones activas"""
+    try:
+        api = get_api_connection()
+        scheduler = api.path('system', 'scheduler')
+        
+        schedules = []
+        for task in scheduler:
+            if "Programado" in task.get('comment', ''):
+                schedules.append({
+                    'id': task.get('.id'),
+                    'name': task.get('name'),
+                    'comment': task.get('comment'),
+                    'start_time': task.get('start-time'),
+                    'interval': task.get('interval'),
+                    'disabled': task.get('disabled') == 'true'
+                })
+        
+        return jsonify({'schedules': schedules}), 200
+    except Exception as e:
+        logger.error(f"Error al listar programaciones: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if 'api' in locals():
+            api.close()
 
 # =======================
-# Configuración para despliegue
+# Inicialización
 # =======================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
