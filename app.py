@@ -16,7 +16,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuración MikroTik desde env
-MIKROTIK_HOST = os.environ.get('MIKROTIK_HOST', 'https://tu-ngrok-or-host')
+MIKROTIK_HOST = os.environ.get('MIKROTIK_HOST', 'tcp://8.tcp.us-cal-1.ngrok.io:18948')
 USERNAME = os.environ.get('MIKROTIK_USER', 'admin')
 PASSWORD = os.environ.get('MIKROTIK_PASSWORD', '1234567890')
 REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', 10))
